@@ -78,7 +78,10 @@ public final class PearlBucketPlugin extends JavaPlugin implements Listener {
     private final Map<UUID, CapturedPearl> capturedPearls = new HashMap<>();
     private final Map<UUID, PendingTeleport> pendingTeleports = new HashMap<>();
     private final Map<BlockKey, List<PearlBucketSlot>> dispenserPearlBuckets = new HashMap<>();
-    private final Set<UUID> suppressedBucketEmptyPlayers = new HashSet<>();
+    private final Map<UUID, Integer> lastCaptureTick = new HashMap<>();
+    private final Map<UUID, Integer> lastReleaseTick = new HashMap<>();
+
+    private double captureAimToleranceSquared;
 
     @Override
     public void onEnable() {
@@ -87,6 +90,9 @@ public final class PearlBucketPlugin extends JavaPlugin implements Listener {
         ownerNameKey = new NamespacedKey(this, "owner_name");
         pearlBucketModelKey = new NamespacedKey(this, "pearl_bucket");
         virtualPearlKey = new NamespacedKey(this, "virtual_pearl");
+
+        double aimTolerance = getConfig().getDouble("capture-aim-tolerance", 0.25);
+        captureAimToleranceSquared = aimTolerance * aimTolerance;
 
         Bukkit.getPluginManager().registerEvents(this, this);
         loadPendingTeleports();
@@ -113,26 +119,31 @@ public final class PearlBucketPlugin extends JavaPlugin implements Listener {
         }
 
         if (capturePearl(player, event.getHand(), pearl, true, false)) {
-            suppressNextBucketEmpty(player.getUniqueId());
+            noteCaptureTick(player.getUniqueId());
             event.setCancelled(true);
         }
     }
 
     @EventHandler(ignoreCancelled = false, priority = EventPriority.LOWEST)
     public void onPearlBucketFill(PlayerBucketFillEvent event) {
+        if (captureSuppressed(event.getPlayer().getUniqueId())) {
+            event.setCancelled(true);
+            return;
+        }
         Optional<EnderPearl> pearl = findPearlForBucketFill(event);
         if (pearl.isEmpty()) {
             return;
         }
 
         if (capturePearl(event.getPlayer(), event.getHand(), pearl.get(), true, false)) {
+            noteCaptureTick(event.getPlayer().getUniqueId());
             event.setCancelled(true);
         }
     }
 
     @EventHandler(ignoreCancelled = true, priority = EventPriority.HIGHEST)
     public void onPearlBucketEmpty(PlayerBucketEmptyEvent event) {
-        if (suppressedBucketEmptyPlayers.remove(event.getPlayer().getUniqueId())) {
+        if (releaseSuppressed(event.getPlayer().getUniqueId())) {
             event.setCancelled(true);
             return;
         }
@@ -142,6 +153,7 @@ public final class PearlBucketPlugin extends JavaPlugin implements Listener {
         if (data.isEmpty()) {
             return;
         }
+        noteReleaseTick(event.getPlayer().getUniqueId());
 
         BucketData bucket = data.get();
         CapturedPearl pearl = consumeCapturedPearl(bucket, stack);
@@ -175,8 +187,14 @@ public final class PearlBucketPlugin extends JavaPlugin implements Listener {
         ItemStack stack = event.getHand() == EquipmentSlot.OFF_HAND
                 ? player.getInventory().getItemInOffHand()
                 : player.getInventory().getItemInMainHand();
+        if (stack.getType() == Material.BUCKET && captureSuppressed(player.getUniqueId())) {
+            event.setUseInteractedBlock(Result.DENY);
+            event.setUseItemInHand(Result.DENY);
+            event.setCancelled(true);
+            return;
+        }
         if (stack.getType() == Material.BUCKET && capturePearlFromWaterInteraction(event)) {
-            suppressNextBucketEmpty(player.getUniqueId());
+            noteCaptureTick(player.getUniqueId());
             event.setUseInteractedBlock(Result.DENY);
             event.setUseItemInHand(Result.DENY);
             event.setCancelled(true);
@@ -184,7 +202,7 @@ public final class PearlBucketPlugin extends JavaPlugin implements Listener {
         }
 
         if (stack.getType() == Material.BUCKET && captureLookedAtPearl(player, event.getHand())) {
-            suppressNextBucketEmpty(player.getUniqueId());
+            noteCaptureTick(player.getUniqueId());
             event.setUseInteractedBlock(Result.DENY);
             event.setUseItemInHand(Result.DENY);
             event.setCancelled(true);
@@ -196,6 +214,10 @@ public final class PearlBucketPlugin extends JavaPlugin implements Listener {
             return;
         }
 
+        if (releaseSuppressed(player.getUniqueId())) {
+            return;
+        }
+
         Optional<PearlReleaseTarget> target = pearlReleaseTarget(event);
         if (target.isEmpty()) {
             return;
@@ -204,6 +226,7 @@ public final class PearlBucketPlugin extends JavaPlugin implements Listener {
         CapturedPearl pearl = consumeCapturedPearl(data.get(), stack);
         event.setCancelled(true);
         releasePearlBucket(player, event.getHand(), pearl, target.get());
+        noteReleaseTick(player.getUniqueId());
     }
 
     @EventHandler(ignoreCancelled = true, priority = EventPriority.HIGHEST)
@@ -531,7 +554,7 @@ public final class PearlBucketPlugin extends JavaPlugin implements Listener {
             return false;
         }
 
-        return lookOffsetSquared(eye, direction, pearl) <= 1.0;
+        return lookOffsetSquared(eye, direction, pearl) <= captureAimToleranceSquared;
     }
 
     private double lookOffsetSquared(Vector eye, Vector direction, EnderPearl pearl) {
@@ -541,7 +564,7 @@ public final class PearlBucketPlugin extends JavaPlugin implements Listener {
     }
 
     private Vector eyeToPearlVector(Vector eye, EnderPearl pearl) {
-        return pearl.getLocation().toVector().subtract(eye).add(new Vector(0.0, -0.25, 0.0));
+        return pearl.getLocation().toVector().subtract(eye).add(new Vector(0.0, 0.125, 0.0));
     }
 
     private boolean hasLineOfSightToPearl(Location eye, EnderPearl pearl) {
@@ -562,9 +585,22 @@ public final class PearlBucketPlugin extends JavaPlugin implements Listener {
                 || blockHit.getHitPosition().distanceSquared(eye.toVector()) + 0.04 >= (distance * distance);
     }
 
-    private void suppressNextBucketEmpty(UUID playerId) {
-        suppressedBucketEmptyPlayers.add(playerId);
-        Bukkit.getScheduler().runTask(this, () -> suppressedBucketEmptyPlayers.remove(playerId));
+    private void noteCaptureTick(UUID playerId) {
+        lastCaptureTick.put(playerId, Bukkit.getCurrentTick());
+    }
+
+    private boolean releaseSuppressed(UUID playerId) {
+        Integer tick = lastCaptureTick.get(playerId);
+        return tick != null && Bukkit.getCurrentTick() - tick <= 1;
+    }
+
+    private void noteReleaseTick(UUID playerId) {
+        lastReleaseTick.put(playerId, Bukkit.getCurrentTick());
+    }
+
+    private boolean captureSuppressed(UUID playerId) {
+        Integer tick = lastReleaseTick.get(playerId);
+        return tick != null && Bukkit.getCurrentTick() - tick <= 1;
     }
 
     private boolean isPearlInBucketedBlock(EnderPearl pearl, Block waterBlock) {
