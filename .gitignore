@@ -1,0 +1,11 @@
+.gradle/
+build/
+out/
+.idea/
+.vscode/
+resource-pack/*.zip
+Thumbs.db
+.DS_Store
+
+*.log
+*.tmp

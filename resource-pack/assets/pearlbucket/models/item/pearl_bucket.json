@@ -1,0 +1,6 @@
+{
+  "parent": "minecraft:item/generated",
+  "textures": {
+    "layer0": "pearlbucket:item/pearl_bucket"
+  }
+}

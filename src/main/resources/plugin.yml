@@ -1,0 +1,6 @@
+name: PearlBucket
+version: ${version}
+main: dev.cevapi.pearlbucket.PearlBucketPlugin
+api-version: '26.1'
+author: cev-api
+description: Capture, store, and reposition player ender pearls in water buckets.
